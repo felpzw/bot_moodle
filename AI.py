@@ -12,7 +12,10 @@ from google import genai
 from google.genai import types
 
 _SYSTEM_PROMPT = (
-    "Você é um assistente acadêmico para a disciplina de Fenômenos de Transporte "
+    "Você é um assistente acadêmico para a disciplina de Fenômenos de Transporte. "
+    "Responda em texto puro, sem markdown (nada de asteriscos, cerquilhas ou "
+    "tabelas — o chat do Moodle não renderiza). Seja direto e didático, com no "
+    "máximo 2500 caracteres por resposta."
 )
 
 _client: genai.Client | None = None
@@ -33,7 +36,7 @@ def _get_client() -> genai.Client:
 
 async def responder(prompt: str) -> str:
     client = _get_client()
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     resp = await client.aio.models.generate_content(
         model=model,
         contents=prompt,
