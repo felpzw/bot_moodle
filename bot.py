@@ -28,6 +28,11 @@ POLL_INTERVAL_S = 5
 KEEP_ALIVE_S = 900
 HTTP_TIMEOUT_S = 30
 
+# Prefixo das respostas geradas pela IA. Necessário porque na conversa
+# "comigo mesmo" todas as mensagens têm o mesmo useridfrom — só o marcador
+# distingue resposta do bot de mensagem do usuário (e evita loop infinito).
+BOT_MARKER = "🤖"
+
 logger = logging.getLogger("moodle_bot")
 
 
@@ -42,6 +47,36 @@ class BotState:
 
 
 # --------------------------------- auth ------------------------------------ #
+
+async def _dismiss_collecta(client: httpx.AsyncClient, resp: httpx.Response) -> httpx.Response:
+    """Adia a pesquisa institucional (Collecta) que intercepta o login CAS.
+
+    O CAS da UFSC desvia o pós-login para collecta.sistemas.ufsc.br enquanto
+    houver avaliação pendente. Clicar em "Responder mais tarde" preserva a
+    possibilidade de responder depois (nunca usar "Não tenho interesse", que
+    é irreversível) e redireciona de volta ao Moodle já autenticado.
+    """
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for form in soup.find_all("form"):
+        btn = next(
+            (i for i in form.find_all("input") if i.get("value") == "Responder mais tarde"),
+            None,
+        )
+        if btn is None:
+            continue
+        data = {
+            i.get("name"): i.get("value", "")
+            for i in form.find_all("input", type="hidden")
+            if i.get("name")
+        }
+        data[btn["name"]] = btn["value"]
+        action = urljoin(str(resp.url), form.get("action", ""))
+        out = await client.post(action, data=data, follow_redirects=True)
+        out.raise_for_status()
+        logger.info("Collecta interceptou o login; adiado com 'Responder mais tarde'")
+        return out
+    raise RuntimeError("interceptação Collecta sem botão 'Responder mais tarde'")
+
 
 async def authenticate(state: BotState, username: str, password: str) -> None:
     """Login via CAS da UFSC (sistemas.ufsc.br) e captura sesskey no dashboard.
@@ -77,6 +112,17 @@ async def authenticate(state: BotState, username: str, password: str) -> None:
     resp = await state.client.post(post_url, data=payload, follow_redirects=True)
     resp.raise_for_status()
 
+    # O CAS da UFSC pode desviar o pós-login para sistemas intermediários e o
+    # ticket nunca chega ao Moodle.
+    if "collecta" in str(resp.url):
+        resp = await _dismiss_collecta(state.client, resp)
+    elif "moodle.ufsc.br" not in str(resp.url):
+        # Outro desvio desconhecido: com a sessão CAS já criada, um novo GET
+        # no login do Moodle emite o ticket silenciosamente.
+        logger.info("pós-login desviado para %s; refazendo GET no Moodle", resp.url.host)
+        resp = await state.client.get(URL_LOGIN, follow_redirects=True)
+        resp.raise_for_status()
+
     # Vai ao dashboard para capturar o sesskey.
     dash = await state.client.get(URL_DASHBOARD, follow_redirects=True)
     dash.raise_for_status()
@@ -104,6 +150,23 @@ class SessionExpired(Exception):
     """Cookie/sesskey inválidos — exige re-login."""
 
 
+# Moodle rejeita mensagens acima de ~4096 caracteres (errormessagetoolong);
+# margem para o overhead de encoding.
+MAX_MSG_CHARS = 3800
+
+
+def _chunk(text: str, size: int = MAX_MSG_CHARS) -> list[str]:
+    """Divide o texto em blocos ≤ size, quebrando em espaço quando possível."""
+    chunks: list[str] = []
+    while len(text) > size:
+        cut = text.rfind(" ", size // 2, size)
+        cut = cut if cut != -1 else size
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+    chunks.append(text)
+    return chunks
+
+
 def _build_payload(conversation_id: str, content: str) -> list[dict]:
     return [
         {
@@ -111,7 +174,7 @@ def _build_payload(conversation_id: str, content: str) -> list[dict]:
             "methodname": "core_message_send_messages_to_conversation",
             "args": {
                 "conversationid": int(conversation_id),
-                "messages": [{"text": content}],
+                "messages": [{"text": c} for c in _chunk(content)],
             },
         }
     ]
@@ -317,14 +380,14 @@ async def reader_loop(
         latest = msgs[0]
         msg_id: int = latest["id"]
 
-        # Ignora mensagem já vista ou enviada pelo próprio bot.
-        if msg_id <= last_seen_id or latest.get("useridfrom") == state.user_id:
-            last_seen_id = max(last_seen_id, msg_id)
+        if msg_id <= last_seen_id:
             continue
-
         last_seen_id = msg_id
+
         text = _strip_html(latest.get("text", ""))
-        if not text:
+        # Ignora mensagens vazias e respostas do próprio bot (identificadas
+        # pelo marcador — o useridfrom não serve na conversa consigo mesmo).
+        if not text or text.startswith(BOT_MARKER):
             continue
 
         logger.info("reader: nova msg [%s] de userid=%s — %s…",
@@ -335,7 +398,8 @@ async def reader_loop(
                 await conn.execute(
                     "INSERT INTO message_queue (moodle_user_id, conversation_id, content)"
                     " VALUES ($1, $2, $3)",
-                    str(latest.get("useridfrom", 0)), conversation_id, reply,
+                    str(latest.get("useridfrom", 0)), conversation_id,
+                    f"{BOT_MARKER} {reply}",
                 )
             logger.info("reader: resposta IA enfileirada (convid=%s)", conversation_id)
         except Exception:
@@ -411,9 +475,6 @@ async def main() -> None:
                 for t in tasks:
                     t.cancel()
     finally:
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM message_queue")
-        logger.info("fila limpa")
         await pool.close()
 
 
