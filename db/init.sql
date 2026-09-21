@@ -1,4 +1,4 @@
--- Schema da fila de mensagens (executado automaticamente no primeiro boot do container)
+-- Message queue schema (initialized when the container's data directory is empty).
 
 CREATE TYPE message_status AS ENUM ('PENDING', 'SENT', 'FAILED');
 
@@ -13,5 +13,5 @@ CREATE TABLE message_queue (
     error_log TEXT
 );
 
--- Índice para otimizar a busca rápida por mensagens pendentes
+-- Partial index for pending-message lookups.
 CREATE INDEX idx_message_status ON message_queue(status) WHERE status = 'PENDING';
